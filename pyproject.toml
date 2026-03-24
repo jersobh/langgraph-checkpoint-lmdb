@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "LangGraph checkpointer using LMDB"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
 dependencies = [
     "langgraph-checkpoint>=2.0.0",
     "lmdb>=1.4.1",
@@ -22,3 +22,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "langchain-openai>=0.1.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["langgraph_checkpoint_lmdb*"]
+exclude = ["examples*", "tests*", "chatbot_persistence_db*"]
