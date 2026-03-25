@@ -115,7 +115,7 @@ class LMDBSaver(BaseCheckpointSaver[str]):
 
             data = self._deserialize(value)
             checkpoint = self.serde.loads_typed((data["type"], data["checkpoint"]))
-            metadata = data["metadata"]
+            metadata = self.serde.loads(data["metadata"]) if isinstance(data["metadata"], bytes) else data["metadata"]
             parent_config = None
             if data.get("parent_checkpoint_id"):
                 parent_config = {
@@ -195,7 +195,7 @@ class LMDBSaver(BaseCheckpointSaver[str]):
                 
                 data = self._deserialize(value)
                 checkpoint = self.serde.loads_typed((data["type"], data["checkpoint"]))
-                metadata = data["metadata"]
+                metadata = self.serde.loads(data["metadata"]) if isinstance(data["metadata"], bytes) else data["metadata"]
                 
                 parent_config = None
                 if data.get("parent_checkpoint_id"):
@@ -257,7 +257,7 @@ class LMDBSaver(BaseCheckpointSaver[str]):
         data = {
             "type": type_,
             "checkpoint": blob,
-            "metadata": metadata,
+            "metadata": self.serde.dumps(metadata),
             "parent_checkpoint_id": parent_checkpoint_id,
         }
         
