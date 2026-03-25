@@ -19,9 +19,10 @@ LMDB is a transactional, memory-mapped key-value store. It is **incredibly fast*
 ## Features
 
 - **Blazing Fast Local Storage**: Optimized for high-frequency writes and low-latency state retrieval.
-- **Binary Key Strategy**: Uses a compact binary key layout (`thread_id\x00checkpoint_ns\x00checkpoint_id`) for efficient multi-index prefix scanning.
-- **Flexible Serialization**: Supports both `msgpack` (default) and `orjson` for high-speed state encoding.
-- **Async & Sync Support**: Provides both thread-safe synchronous (`LMDBSaver`) and non-blocking asynchronous (`AsyncLMDBSaver`) implementations.
+- **Bespoke Key Strategy**: Uses a compact binary key layout (`thread_id\x00checkpoint_ns\x00checkpoint_id`) for efficient multi-index prefix scanning.
+- **Improved Concurrency**: Shared lock mechanism for multi-instance support across the same environment.
+- **Flexible Serialization**: Supports `msgpack` (default) and `orjson`, with robust fallback for newer `langgraph-checkpoint` versions.
+- **Async & Sync Support**: Thread-safe synchronous (`LMDBSaver`) and non-blocking asynchronous (`AsyncLMDBSaver`) implementations.
 
 ## Installation
 
@@ -54,9 +55,12 @@ Benchmarks conducted on local hardware comparing `LMDBSaver` with the default `M
 
 | Scenario | MemorySaver | LMDBSaver | 🏆 Winner |
 | :--- | ---: | ---: | :--- |
-| Sequential Writes (1K) | 30,914 ops/s | 19,619 ops/s | MemorySaver |
-| Concurrent Writes (15T×200) | 33,947 ops/s | 8,523 ops/s | MemorySaver |
-| History Query (list 100) | 52,672 ops/s | 45,319 ops/s | MemorySaver |
+| Sequential Writes (1K) | 44,930 ops/s | 15,461 ops/s | MemorySaver |
+| Concurrent Writes (15T×200) | 31,776 ops/s | 8,205 ops/s | MemorySaver |
+| History Query (list 100) | 38,732 ops/s | 46,692 ops/s | LMDBSaver |
+
+> [!TIP]
+> After recent optimizations, `LMDBSaver` significantly outperforms `MemorySaver` in history queries and multi-index scans due to LMDB's efficient prefix-based cursor navigation.
 
 > [!TIP]
 > `LMDBSaver` handles persistent storage while maintaining performance within the same magnitude as in-memory storage, making it ideal for edge devices and high-load local agents.
