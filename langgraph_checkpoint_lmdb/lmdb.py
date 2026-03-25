@@ -15,6 +15,7 @@ from typing import (
 import lmdb
 import orjson
 import msgpack
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 from langgraph.checkpoint.base import (
@@ -29,6 +30,17 @@ from langgraph.checkpoint.base import (
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 logger = logging.getLogger(__name__)
+
+# Global map to share locks across checkpointer instances using the same LMDB environment object
+_ENV_LOCKS = weakref.WeakKeyDictionary()
+_ENV_LOCKS_LOCK = threading.Lock()
+
+def _get_env_lock(env: lmdb.Environment) -> threading.Lock:
+    """Get or create a threading.Lock associated with an LMDB Environment object."""
+    with _ENV_LOCKS_LOCK:
+        if env not in _ENV_LOCKS:
+            _ENV_LOCKS[env] = threading.Lock()
+        return _ENV_LOCKS[env]
 
 class LMDBSaver(BaseCheckpointSaver[str]):
     """LMDB-backed LangGraph checkpointer."""
@@ -45,7 +57,7 @@ class LMDBSaver(BaseCheckpointSaver[str]):
         self.encoding = encoding
         self._db = self.env.open_db(b"checkpoints")
         self._writes_db = self.env.open_db(b"writes")
-        self.lock = threading.Lock()
+        self.lock = _get_env_lock(env)
 
     def _serialize(self, data: Any) -> bytes:
         if self.encoding == "orjson":
@@ -76,27 +88,14 @@ class LMDBSaver(BaseCheckpointSaver[str]):
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         checkpoint_id = config["configurable"].get("checkpoint_id")
 
-        with self.env.begin(db=self._db) as txn:
+        with self.env.begin() as txn:
             if checkpoint_id:
                 key = self._make_key(thread_id, checkpoint_ns, checkpoint_id)
-                value = txn.get(key)
+                value = txn.get(key, db=self._db)
             else:
                 # Get the most recent checkpoint for this thread_id and checkpoint_ns
                 prefix = self._make_prefix(thread_id, checkpoint_ns)
-                cursor = txn.cursor()
-                # LMDB stores keys in lexicographical order. 
-                # To get the "latest", we might need a timestamp or just rely on IDs if they are lexicographical (UUIDv7-like).
-                # Actually, standard LangGraph IDs are not necessarily lexicographical.
-                # Let's check how Postgres does it: it uses a timestamp.
-                # I should probably store checkpoints with some order or use a secondary index.
-                # However, the user didn't specify.
-                
-                # If we want "latest", we should ideally have a timestamp in the key or a separate index.
-                # Given LMDB is local, we can just scan for now or implement a better key.
-                
-                # Let's refine the key to include a timestamp if we want "latest" naturally.
-                # But LangGraph usually expects the "latest" version.
-                
+                cursor = txn.cursor(db=self._db)
                 # Searching for the last key with this prefix:
                 if cursor.set_range(prefix + b"\xff"):
                     cursor.prev()
@@ -115,7 +114,15 @@ class LMDBSaver(BaseCheckpointSaver[str]):
 
             data = self._deserialize(value)
             checkpoint = self.serde.loads_typed((data["type"], data["checkpoint"]))
-            metadata = self.serde.loads(data["metadata"]) if isinstance(data["metadata"], bytes) else data["metadata"]
+            
+            metadata_data = data["metadata"]
+            if isinstance(metadata_data, dict) and "type" in metadata_data and "value" in metadata_data:
+                metadata = self.serde.loads_typed((metadata_data["type"], metadata_data["value"]))
+            elif hasattr(self.serde, "loads"):
+                metadata = self.serde.loads(metadata_data) if isinstance(metadata_data, bytes) else metadata_data
+            else:
+                metadata = metadata_data
+
             parent_config = None
             if data.get("parent_checkpoint_id"):
                 parent_config = {
@@ -128,15 +135,16 @@ class LMDBSaver(BaseCheckpointSaver[str]):
 
             # Get writes
             writes = []
-            with self.env.begin(db=self._writes_db) as w_txn:
-                w_cursor = w_txn.cursor()
-                w_prefix = self._make_prefix(thread_id, checkpoint_ns) + checkpoint_id.encode() + b"\x00"
-                if w_cursor.set_range(w_prefix):
-                    for k, v in w_cursor:
-                        if not k.startswith(w_prefix):
-                            break
-                        w_data = self._deserialize(v)
-                        writes.append((w_data["task_id"], w_data["channel"], self.serde.loads_typed((w_data["type"], w_data["value"]))))
+            w_cursor = txn.cursor(db=self._writes_db)
+            w_prefix = self._make_prefix(thread_id, checkpoint_ns) + checkpoint_id.encode() + b"\x00"
+            if w_cursor.set_range(w_prefix):
+                for k, v in w_cursor:
+                    if not k.startswith(w_prefix):
+                        break
+                    w_data = self._deserialize(v)
+                    # Use loads_typed for compatibility with newer langgraph-checkpoint
+                    w_value = self.serde.loads_typed((w_data["type"], w_data["value"]))
+                    writes.append((w_data["task_id"], w_data["channel"], w_value))
 
             return CheckpointTuple(
                 config={
@@ -170,8 +178,8 @@ class LMDBSaver(BaseCheckpointSaver[str]):
             else:
                 prefix = f"{thread_id}\x00".encode()
 
-        with self.env.begin(db=self._db) as txn:
-            cursor = txn.cursor()
+        with self.env.begin() as txn:
+            cursor = txn.cursor(db=self._db)
             if before and "checkpoint_id" in before["configurable"]:
                 # Start before the specified ID
                 before_key = self._make_key(thread_id, checkpoint_ns, before["configurable"]["checkpoint_id"])
@@ -195,7 +203,14 @@ class LMDBSaver(BaseCheckpointSaver[str]):
                 
                 data = self._deserialize(value)
                 checkpoint = self.serde.loads_typed((data["type"], data["checkpoint"]))
-                metadata = self.serde.loads(data["metadata"]) if isinstance(data["metadata"], bytes) else data["metadata"]
+                
+                metadata_data = data["metadata"]
+                if isinstance(metadata_data, dict) and "type" in metadata_data and "value" in metadata_data:
+                    metadata = self.serde.loads_typed((metadata_data["type"], metadata_data["value"]))
+                elif hasattr(self.serde, "loads"):
+                    metadata = self.serde.loads(metadata_data) if isinstance(metadata_data, bytes) else metadata_data
+                else:
+                    metadata = metadata_data
                 
                 parent_config = None
                 if data.get("parent_checkpoint_id"):
@@ -207,17 +222,17 @@ class LMDBSaver(BaseCheckpointSaver[str]):
                         }
                     }
                 
-                # Get writes (could be optimized by caching txn)
+                # Get writes
                 writes = []
-                with self.env.begin(db=self._writes_db) as w_txn:
-                    w_cursor = w_txn.cursor()
-                    w_prefix = self._make_prefix(t_id, ns) + c_id.encode() + b"\x00"
-                    if w_cursor.set_range(w_prefix):
-                        for wk, wv in w_cursor:
-                            if not wk.startswith(w_prefix):
-                                break
-                            w_data = self._deserialize(wv)
-                            writes.append((w_data["task_id"], w_data["channel"], self.serde.loads_typed((w_data["type"], w_data["value"]))))
+                w_cursor = txn.cursor(db=self._writes_db)
+                w_prefix = self._make_prefix(t_id, ns) + c_id.encode() + b"\x00"
+                if w_cursor.set_range(w_prefix):
+                    for wk, wv in w_cursor:
+                        if not wk.startswith(w_prefix):
+                            break
+                        w_data = self._deserialize(wv)
+                        w_value = self.serde.loads_typed((w_data["type"], w_data["value"]))
+                        writes.append((w_data["task_id"], w_data["channel"], w_value))
 
                 yield CheckpointTuple(
                     config={
@@ -253,11 +268,20 @@ class LMDBSaver(BaseCheckpointSaver[str]):
         parent_checkpoint_id = config["configurable"].get("checkpoint_id")
         type_, blob = self.serde.dumps_typed(checkpoint)
         
+        # For metadata, we use dumps_typed if available, or fallback to standard serialization
+        # In newer langgraph-checkpoint, metadata is often serialized as part of the checkpoint or separately
+        if hasattr(self.serde, "dumps"):
+            serialized_metadata = self.serde.dumps(metadata)
+        else:
+            # Fallback for serializers that only have dumps_typed
+            m_type, m_blob = self.serde.dumps_typed(metadata)
+            serialized_metadata = {"type": m_type, "value": m_blob}
+
         key = self._make_key(thread_id, checkpoint_ns, checkpoint_id)
         data = {
             "type": type_,
             "checkpoint": blob,
-            "metadata": self.serde.dumps(metadata),
+            "metadata": serialized_metadata,
             "parent_checkpoint_id": parent_checkpoint_id,
         }
         
