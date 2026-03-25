@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from contextlib import contextmanager, asynccontextmanager
 from typing import (
     Any,
@@ -44,6 +45,7 @@ class LMDBSaver(BaseCheckpointSaver[str]):
         self.encoding = encoding
         self._db = self.env.open_db(b"checkpoints")
         self._writes_db = self.env.open_db(b"writes")
+        self.lock = threading.Lock()
 
     def _serialize(self, data: Any) -> bytes:
         if self.encoding == "orjson":
@@ -259,8 +261,9 @@ class LMDBSaver(BaseCheckpointSaver[str]):
             "parent_checkpoint_id": parent_checkpoint_id,
         }
         
-        with self.env.begin(db=self._db, write=True) as txn:
-            txn.put(key, self._serialize(data))
+        with self.lock:
+            with self.env.begin(db=self._db, write=True) as txn:
+                txn.put(key, self._serialize(data))
             
         return {
             "configurable": {
@@ -281,19 +284,20 @@ class LMDBSaver(BaseCheckpointSaver[str]):
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         checkpoint_id = config["configurable"]["checkpoint_id"]
         
-        with self.env.begin(db=self._writes_db, write=True) as txn:
-            for idx, (channel, value) in enumerate(writes):
-                mapped_idx = WRITES_IDX_MAP.get(channel, idx)
-                type_, blob = self.serde.dumps_typed(value)
-                # Key: thread_id:ns:checkpoint_id:task_id:idx
-                key = f"{thread_id}\x00{checkpoint_ns}\x00{checkpoint_id}\x00{task_id}\x00{mapped_idx}".encode()
-                data = {
-                    "task_id": task_id,
-                    "channel": channel,
-                    "type": type_,
-                    "value": blob,
-                }
-                txn.put(key, self._serialize(data))
+        with self.lock:
+            with self.env.begin(db=self._writes_db, write=True) as txn:
+                for idx, (channel, value) in enumerate(writes):
+                    mapped_idx = WRITES_IDX_MAP.get(channel, idx)
+                    type_, blob = self.serde.dumps_typed(value)
+                    # Key: thread_id:ns:checkpoint_id:task_id:idx
+                    key = f"{thread_id}\x00{checkpoint_ns}\x00{checkpoint_id}\x00{task_id}\x00{mapped_idx}".encode()
+                    data = {
+                        "task_id": task_id,
+                        "channel": channel,
+                        "type": type_,
+                        "value": blob,
+                    }
+                    txn.put(key, self._serialize(data))
 
 class AsyncLMDBSaver(BaseCheckpointSaver[str]):
     """Async LMDB-backed LangGraph checkpointer."""
